@@ -124,6 +124,23 @@ class AnthropicConversionTests(unittest.TestCase):
         self.assertEqual(result_part["functionResponse"]["name"], "Bash")
         self.assertEqual(result_part["functionResponse"]["id"], "f1")
 
+    def test_tool_result_uses_supported_gemini_user_role(self):
+        body = {"model": "gemini-3.8-flash", "messages": [
+            {"role": "user", "content": "Find Notes"},
+            {"role": "assistant", "content": [
+                {"type": "tool_use", "id": "call_f1|sig1", "name": "Grep", "input": {"pattern": "Notes"}},
+            ]},
+            {"role": "user", "content": [
+                {"type": "tool_result", "tool_use_id": "call_f1|sig1", "content": "Found one match"},
+            ]},
+        ]}
+        with patch.object(proxy, "get_project_id", return_value="test-project"):
+            request = proxy._build_gemini_request(compat.anthropic_request_to_openai(body),
+                                                   "gemini-3.8-flash-tiered", "medium")
+        self.assertEqual(request["request"]["contents"][-1], {"role": "user", "parts": [
+            {"functionResponse": {"name": "Grep", "response": {"result": "Found one match"}, "id": "f1"}},
+        ]})
+
     def test_two_same_named_tools_stay_distinct(self):
         body = {"model": "claude-opus-5-5", "max_tokens": 128, "messages": [
             {"role": "assistant", "content": [

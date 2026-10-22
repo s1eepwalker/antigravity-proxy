@@ -572,7 +572,7 @@ def _build_gemini_request(body: dict, backend_model: str, thinking_level: str = 
             if fc_response_id:
                 func_resp["id"] = fc_response_id
             contents.append({
-                "role": "function",
+                "role": "user",
                 "parts": [{"functionResponse": func_resp}],
             })
             continue
@@ -1386,7 +1386,11 @@ class ProxyHandler(BaseHTTPRequestHandler):
             self._send_anthropic_error(502, "Upstream returned an empty stream")
             return
         except UpstreamError as e:
-            if e.status == 400 and any(item["role"] == "function" for item in envelope["request"]["contents"]):
+            if e.status == 400 and any(
+                "functionResponse" in part
+                for content in envelope["request"]["contents"]
+                for part in content.get("parts", [])
+            ):
                 try:
                     response = call_generate_content(envelope)
                     if not isinstance(response, dict) or not response.get("candidates"):
