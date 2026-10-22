@@ -178,22 +178,50 @@ hermes config set model.default gemini-3.5-flash
 </details>
 
 <details>
-<summary><b>Claude Code</b></summary>
+<summary><b>Claude Code via `agy-claude`</b></summary>
+
+From the repository root, start the proxy in a separate terminal (it must be running whenever you use the alias):
 
 ```bash
-export ANTHROPIC_BASE_URL=http://127.0.0.1:8877
-export ANTHROPIC_AUTH_TOKEN=unused
-export ANTHROPIC_MODEL=gemini-3.8-flash
-claude  # sends /v1/messages to the local proxy
+python3 antigravity_proxy.py
+curl http://127.0.0.1:8877/health
 ```
 
-For the local checkout at `~/projects/antigravity-proxy`, start the proxy in a separate terminal:
+Create a **separate** `~/.claude/agy-settings.json` so your other Claude Code providers and settings stay unchanged:
+
+```json
+{
+  "env": {
+    "ANTHROPIC_BASE_URL": "http://127.0.0.1:8877",
+    "ANTHROPIC_AUTH_TOKEN": "unused",
+    "ANTHROPIC_MODEL": "gemini-3.8-flash",
+    "ANTHROPIC_DEFAULT_OPUS_MODEL": "claude-opus-5-5",
+    "ANTHROPIC_DEFAULT_SONNET_MODEL": "claude-sonnet-5-5",
+    "ANTHROPIC_DEFAULT_HAIKU_MODEL": "gemini-3.8-flash",
+    "CLAUDE_CODE_SUBAGENT_MODEL": "claude-sonnet-5-5",
+    "CLAUDE_CODE_EFFORT_LEVEL": "medium",
+    "CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC": "1"
+  },
+  "modelPicker": {
+    "replaceBuiltInOptions": true,
+    "options": [
+      { "model": "claude-opus-5-5", "label": "Claude Opus 5.5" },
+      { "model": "claude-sonnet-5-5", "label": "Claude Sonnet 5.5" },
+      { "model": "gemini-4-argon", "label": "Gemini 4 Argon", "behavesAs": "claude-opus-5-5" },
+      { "model": "gemini-3.8-flash", "label": "Gemini 3.8 Flash", "behavesAs": "claude-sonnet-5-5" }
+    ]
+  }
+}
+```
+
+Add the alias to `~/.bashrc` and open a new shell (or run `source ~/.bashrc`):
 
 ```bash
-python3 ~/projects/antigravity-proxy/antigravity_proxy.py
+alias agy-claude='claude --dangerously-skip-permissions --settings "$HOME/.claude/agy-settings.json"'
+agy-claude
 ```
 
-The optional `~/.claude/agy-settings.json` keeps this provider separate from your other Claude Code sessions. After adding `alias agy-claude='claude --dangerously-skip-permissions --settings "$HOME/.claude/agy-settings.json"'` to `~/.bashrc`, run `source ~/.bashrc` once (or open a new shell), then `agy-claude`. To verify the proxy without an external model call, use `curl http://127.0.0.1:8877/health`.
+The base URL has **no `/v1` suffix**; Claude Code calls the proxy's `/v1/messages` route. `unused` is a dummy local client token: the proxy authenticates with Google's Antigravity OAuth token from `agy`. Gemini 3.8 Flash is the default and has been tested end-to-end; the other new model mappings are listed for selection but have not all been verified upstream. `--dangerously-skip-permissions` disables Claude Code's permission prompts; remove it from the alias if you want approval prompts. This JSON file and the shell alias are local user configuration, not files installed by cloning this repository.
 </details>
 
 <details>
