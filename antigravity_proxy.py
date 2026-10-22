@@ -4,7 +4,7 @@ Antigravity OpenAI-Compatible Proxy (Cloud Code Assist API)
 
 Bridges Hermes Agent (OpenAI-compatible client) to Google Antigravity's Cloud
 Code Assist API. Uses the OAuth token managed by the Antigravity CLI (agy) and
-talks directly to https://cloudcode-pa.googleapis.com — no `agy` subprocess
+talks directly to https://daily-cloudcode-pa.googleapis.com — no `agy` subprocess
 needed, giving us native streaming + tool/function-call support.
 
 Architecture:
@@ -41,6 +41,12 @@ from urllib.parse import urlparse
 from urllib.request import Request, urlopen
 from urllib.error import HTTPError, URLError
 
+from anthropic_compat import (
+    anthropic_request_to_openai,
+    gemini_stream_to_anthropic,
+    openai_response_to_anthropic,
+)
+
 # ──────────────────────────────────────────────────────────────────────────────
 # Constants
 # ──────────────────────────────────────────────────────────────────────────────
@@ -60,7 +66,7 @@ CLIENT_SECRET = os.environ.get(
 
 TOKEN_FILE = os.path.expanduser("~/.gemini/antigravity-cli/antigravity-oauth-token")
 OAUTH_TOKEN_URL = "https://oauth2.googleapis.com/token"
-CLOUDCODE_BASE = "https://cloudcode-pa.googleapis.com"
+CLOUDCODE_BASE = "https://daily-cloudcode-pa.googleapis.com"
 LOAD_CODEASSIST_URL = f"{CLOUDCODE_BASE}/v1internal:loadCodeAssist"
 GENERATE_CONTENT_URL = f"{CLOUDCODE_BASE}/v1internal:generateContent"
 STREAM_GENERATE_CONTENT_URL = f"{CLOUDCODE_BASE}/v1internal:streamGenerateContent?alt=sse"
@@ -83,12 +89,17 @@ DEFAULT_SYSTEM_INSTRUCTION = "You are a helpful AI assistant."
 UPSTREAM_TIMEOUT = 300  # 5 minutes
 TOKEN_REFRESH_SKEW = 120  # refresh this many seconds before actual expiry
 
-# Model mapping: OpenAI-facing name -> Antigravity backend model name.
-# Tested against cloudcode-pa.googleapis.com on 2026-06-30.
-# Model mapping: OpenAI-facing name -> (backend model name, thinking level).
-# Gemini 3 Pro models use the base name "gemini-3.1-pro-low" and control
+# Model mapping: client-facing name -> (Antigravity backend model, thinking level).
+# Legacy entries were tested on 2026-06-30. Gemini 3.8 Flash uses the
+# tiered backend and medium thinking on the current daily CloudCode endpoint;
+# other newer aliases have not all been verified with upstream generation.
+# Gemini 3 Pro models and the tiered Flash model control
 # thinking compute via generationConfig.thinkingConfig.thinkingLevel.
 MODEL_MAP = {
+    "gemini-4-argon": ("gemini-4-argon-medium", None),
+    "gemini-3.8-flash": ("gemini-3.8-flash-tiered", "medium"),
+    "claude-opus-5-5": ("claude-opus-5-5-medium", None),
+    "claude-sonnet-5-5": ("claude-sonnet-5-5-medium", None),
     "gemini-3.1-pro": ("gemini-3.1-pro-low", "low"),
     "gemini-3.1-pro-high": ("gemini-3.1-pro-low", "high"),
     "gemini-3-flash": ("gemini-3-flash", None),
@@ -99,7 +110,7 @@ MODEL_MAP = {
     "claude-opus-4.6": ("claude-opus-4-6-thinking", None),
 }
 
-DEFAULT_MODEL = "gemini-2.5-flash"
+DEFAULT_MODEL = "gemini-3.8-flash"
 
 # ──────────────────────────────────────────────────────────────────────────────
 # Token / OAuth management (thread-safe)
@@ -375,6 +386,33 @@ def _content_to_text(content) -> str:
     return str(content)
 
 
+_GEMINI_SCHEMA_FIELDS = frozenset({
+    "type", "format", "title", "description", "nullable", "enum", "default",
+    "items", "minItems", "maxItems", "properties", "required",
+    "minProperties", "maxProperties", "minimum", "maximum",
+    "minLength", "maxLength", "pattern", "example", "anyOf",
+    "additionalProperties", "propertyOrdering",
+})
+
+
+def _gemini_tool_schema(schema: dict) -> dict:
+    """Keep only Gemini function-schema fields, recursively and without mutating input."""
+    result = {}
+    for key, value in schema.items():
+        if key not in _GEMINI_SCHEMA_FIELDS:
+            continue
+        if key == "properties" and isinstance(value, dict):
+            result[key] = {name: _gemini_tool_schema(prop) if isinstance(prop, dict) else prop
+                           for name, prop in value.items()}
+        elif key in ("items", "additionalProperties") and isinstance(value, dict):
+            result[key] = _gemini_tool_schema(value)
+        elif key == "anyOf" and isinstance(value, list):
+            result[key] = [_gemini_tool_schema(item) if isinstance(item, dict) else item for item in value]
+        else:
+            result[key] = value
+    return result
+
+
 def _openai_tools_to_gemini(tools: list) -> list:
     """Convert OpenAI tools array to Gemini functionDeclarations format.
 
@@ -399,7 +437,7 @@ def _openai_tools_to_gemini(tools: list) -> list:
         }
         params = func.get("parameters")
         if isinstance(params, dict) and params:
-            decl["parameters"] = params
+            decl["parameters"] = _gemini_tool_schema(params)
         decls.append(decl)
     if not decls:
         return []
@@ -666,7 +704,7 @@ def _build_gemini_request(body: dict, backend_model: str, thinking_level: str = 
         thinking_cfg = gen_config.get("thinkingConfig", {})
         thinking_cfg.setdefault("includeThoughts", False)
         gen_config["thinkingConfig"] = thinking_cfg
-    # Inject thinking level for Gemini 3 Pro models.
+    # Inject the mapped thinking level for models that support it.
     if thinking_level:
         thinking_cfg = gen_config.get("thinkingConfig", {})
         thinking_cfg.setdefault("thinkingLevel", thinking_level)
@@ -720,6 +758,8 @@ def _extract_parts(parts: list) -> tuple[str, list, str]:
     for part in parts or []:
         if not isinstance(part, dict):
             continue
+        if part.get("thought"):
+            continue
         if "text" in part and part["text"]:
             text_chunks.append(part["text"])
         if "functionCall" in part:
@@ -752,11 +792,6 @@ def _extract_parts(parts: list) -> tuple[str, list, str]:
             out = cer.get("output", "")
             if out:
                 text_chunks.append(f"```\n{out}\n```")
-        if "thought" in part and part["thought"]:
-            # Thinking summaries — include as plain text (Gemini sometimes
-            # surfaces these). Keep it; the client can ignore.
-            pass
-
     if tool_calls:
         finish_hint = "tool_calls"
     return "".join(text_chunks), tool_calls, finish_hint
@@ -764,9 +799,9 @@ def _extract_parts(parts: list) -> tuple[str, list, str]:
 
 def _finish_reason_from_gemini(candidate: dict, tool_calls: list) -> str:
     """Map Gemini finishReason / stopReason to OpenAI finish_reason."""
+    if (candidate.get("finishReason") or "").upper() == "MAX_TOKENS":
+        return "length"
     if tool_calls:
-        # If there are tool calls, OpenAI expects "tool_calls".
-        fr = (candidate.get("finishReason") or "").upper()
         # Gemini may say STOP even when emitting function calls.
         return "tool_calls"
     fr = (candidate.get("finishReason") or candidate.get("stopReason") or "").upper()
@@ -861,6 +896,8 @@ def _extract_delta_from_parts(parts: list, prev_tool_names: set) -> tuple[str, l
     for part in parts or []:
         if not isinstance(part, dict):
             continue
+        if part.get("thought"):
+            continue
         if "text" in part and part["text"]:
             text_chunks.append(part["text"])
         if "functionCall" in part:
@@ -953,9 +990,10 @@ def stream_generate_content(envelope: dict):
 
     try:
         buffer = ""
-        # Read in chunks; urllib's response supports iteration by bytes.
+        # Read complete lines so a small SSE event is forwarded without waiting
+        # for an 8192-byte buffer or the end of the upstream response.
         while True:
-            chunk = resp.read(8192)
+            chunk = resp.readline()
             if not chunk:
                 break
             if isinstance(chunk, bytes):
@@ -998,15 +1036,7 @@ def _try_parse_one_event(buffer: str):
                 consumed = idx + len(sep)
                 obj = _parse_sse_block(block)
                 return (obj, consumed)
-        # Maybe single newline-terminated line (some servers use \n not \n\n).
-        nl = buffer.find("\n")
-        if nl != -1 and buffer.strip().startswith("data:"):
-            # Only consume if we have a complete data line.
-            line = buffer[:nl]
-            consumed = nl + 1
-            obj = _parse_sse_block(line)
-            return (obj, consumed)
-        return None  # incomplete
+        return None  # wait for the blank line ending this SSE event
 
     # Bare JSON array stream: [ {...}, {...} ]
     if buffer.lstrip().startswith("["):
@@ -1241,6 +1271,9 @@ class ProxyHandler(BaseHTTPRequestHandler):
             if path in ("/v1/chat/completions", "/chat/completions"):
                 self._handle_chat()
                 self._log_req("POST", path, 200, time.time() - t0)
+            elif path in ("/v1/messages", "/messages"):
+                self._handle_anthropic()
+                self._log_req("POST", path, 200, time.time() - t0)
             elif _GEMINI_PASSTHROUGH_RE.match(path):
                 self._handle_gemini_passthrough(path)
                 self._log_req("POST", path, 200, time.time() - t0)
@@ -1294,6 +1327,115 @@ class ProxyHandler(BaseHTTPRequestHandler):
             return
 
         self._send_json(200, gemini_resp)
+
+    def _send_anthropic_error(self, status, message, err_type="api_error"):
+        self._send_json(status, {"type": "error", "error": {"type": err_type, "message": message}})
+
+    def _handle_anthropic(self):
+        body = self._read_body()
+        try:
+            requested_model = body.get("model")
+            gemini_target = (isinstance(requested_model, str) and
+                             MODEL_MAP.get(requested_model, (requested_model, None))[0].startswith("gemini-"))
+            openai_body = anthropic_request_to_openai(body, gemini_target=gemini_target)
+            model = openai_body.get("model")
+            if not isinstance(model, str) or not model:
+                raise ValueError("model is required")
+            if body.get("stream", False) not in (True, False):
+                raise ValueError("stream must be a boolean")
+        except (ValueError, TypeError) as e:
+            self._send_anthropic_error(400, str(e), "invalid_request_error")
+            return
+
+        backend_model, thinking_level = MODEL_MAP.get(model, (model, None))
+        try:
+            envelope = _build_gemini_request(openai_body, backend_model, thinking_level)
+            if not envelope["request"]["contents"]:
+                raise ValueError("No messages provided")
+        except (ValueError, TypeError, OverflowError) as e:
+            self._send_anthropic_error(400, str(e), "invalid_request_error")
+            return
+        except RuntimeError as e:
+            self._send_anthropic_error(401, str(e), "authentication_error")
+            return
+        except UpstreamError as e:
+            self._send_anthropic_error(e.status, str(e))
+            return
+
+        if body.get("stream"):
+            self._handle_anthropic_stream(envelope, model)
+            return
+        try:
+            response = call_generate_content(envelope)
+            if not isinstance(response, dict) or not response.get("candidates"):
+                raise ValueError("Upstream returned no candidates")
+            converted = openai_response_to_anthropic(gemini_response_to_openai(response, model), model)
+        except UpstreamError as e:
+            self._send_anthropic_error(e.status, str(e))
+            return
+        except (ValueError, TypeError, KeyError) as e:
+            self._send_anthropic_error(502, str(e))
+            return
+        self._send_json(200, converted)
+
+    def _handle_anthropic_stream(self, envelope, model):
+        stream = stream_generate_content(envelope)
+        try:
+            first = next(stream)
+        except StopIteration:
+            self._send_anthropic_error(502, "Upstream returned an empty stream")
+            return
+        except UpstreamError as e:
+            if e.status == 400 and any(item["role"] == "function" for item in envelope["request"]["contents"]):
+                try:
+                    response = call_generate_content(envelope)
+                    if not isinstance(response, dict) or not response.get("candidates"):
+                        raise ValueError("Upstream returned no candidates")
+                except (UpstreamError, ValueError, TypeError, KeyError) as fallback_error:
+                    self._send_anthropic_error(getattr(fallback_error, "status", 502), str(fallback_error))
+                    return
+                first = {"response": response}
+                stream = iter(())
+            else:
+                self._send_anthropic_error(e.status, str(e))
+                return
+        except Exception as e:
+            self._send_anthropic_error(502, f"Upstream stream failed: {e}")
+            return
+
+        error = first.get("error") or (first.get("response") or {}).get("error") if isinstance(first, dict) else None
+        if error:
+            self._send_anthropic_error(502, f"Upstream stream error: {error}")
+            return
+
+        self.send_response(200)
+        self.send_header("Content-Type", "text/event-stream")
+        self.send_header("Cache-Control", "no-cache")
+        self.send_header("Connection", "close")
+        self.end_headers()
+        self.close_connection = True
+
+        def upstream_events():
+            yield first
+            yield from stream
+
+        try:
+            for name, event in gemini_stream_to_anthropic(upstream_events(), model):
+                self.wfile.write(f"event: {name}\ndata: {json.dumps(event)}\n\n".encode())
+                self.wfile.flush()
+        except (BrokenPipeError, ConnectionResetError):
+            pass
+        except Exception as e:
+            _log(f"Anthropic stream error: {e}")
+            try:
+                event = {"type": "error", "error": {"type": "api_error", "message": str(e)}}
+                self.wfile.write(f"event: error\ndata: {json.dumps(event)}\n\n".encode())
+                self.wfile.flush()
+            except (BrokenPipeError, ConnectionResetError):
+                pass
+        finally:
+            if hasattr(stream, "close"):
+                stream.close()
 
     def _handle_chat(self):
         body = self._read_body()

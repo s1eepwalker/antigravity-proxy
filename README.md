@@ -2,7 +2,7 @@
 
 # Antigravity Proxy
 
-**Free Gemini 3.5 Flash, Claude Sonnet 4.6 & more — through a local OpenAI-compatible proxy**
+**Gemini 3.8 Flash, Claude Opus 5.5 & more — through a local OpenAI/Anthropic-compatible proxy**
 
 [![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](https://opensource.org/licenses/MIT)
 [![Python 3.10+](https://img.shields.io/badge/python-3.10+-blue.svg)](https://www.python.org/downloads/)
@@ -26,9 +26,9 @@ Your Tool (OpenAI format)  →  Antigravity Proxy (localhost:8877)  →  Gemini 
 ### Why use this?
 
 - **Free** — uses the OAuth token from the Antigravity CLI, no paid API key
-- **Universal** — works with any OpenAI-compatible tool (Aider, Continue, Hermes, Claude Code, OpenAI SDK, LangChain, etc.)
+- **Universal** — works with OpenAI-compatible tools (Aider, Continue, Hermes, OpenAI SDK, LangChain) and Claude Code via the Anthropic endpoint
 - **No dependencies** — pure Python stdlib, no `pip install` needed
-- **Two endpoints** — OpenAI chat completions + native Gemini passthrough (for images & structured output)
+- **Three endpoints** — OpenAI chat completions, Anthropic Messages for Claude Code, and native Gemini passthrough
 - **Tool/function calling** — full support, including round-trip through conversation history
 - **Streaming** — SSE streaming support for real-time token generation
 
@@ -37,6 +37,7 @@ Your Tool (OpenAI format)  →  Antigravity Proxy (localhost:8877)  →  Gemini 
 ## Features
 
 - **OpenAI-compatible** `POST /v1/chat/completions` — streaming + non-streaming
+- **Anthropic-compatible** `POST /v1/messages` — JSON and SSE responses for Claude Code
 - **Native Gemini passthrough** `POST /v1beta/models/{model}:generateContent` — images, structured JSON output
 - **Tool/function calling** — OpenAI tools format → Gemini functionDeclarations, with round-trip encoding
 - **Model auto-mapping** — use friendly names (`gemini-3.5-flash`), the proxy translates to backend names automatically
@@ -50,6 +51,10 @@ Your Tool (OpenAI format)  →  Antigravity Proxy (localhost:8877)  →  Gemini 
 
 | Friendly Name         | Backend Model              | Thinking       | Type    |
 |-----------------------|----------------------------|----------------|---------|
+| `gemini-4-argon`      | `gemini-4-argon-medium`    | Backend default | Gemini  |
+| `gemini-3.8-flash`    | `gemini-3.8-flash-tiered`  | Medium         | Gemini  |
+| `claude-opus-5-5`     | `claude-opus-5-5-medium`   | Backend default | Claude  |
+| `claude-sonnet-5-5`   | `claude-sonnet-5-5-medium` | Backend default | Claude  |
 | `gemini-3.1-pro`      | `gemini-3.1-pro-low`       | Low            | Gemini  |
 | `gemini-3.1-pro-high` | `gemini-3.1-pro-low`       | High           | Gemini  |
 | `gemini-3-flash`      | `gemini-3-flash`           | —              | Gemini  |
@@ -58,6 +63,8 @@ Your Tool (OpenAI format)  →  Antigravity Proxy (localhost:8877)  →  Gemini 
 | `gemini-2.5-flash`    | `gemini-2.5-flash`         | —              | Gemini  |
 | `claude-sonnet-4.6`   | `claude-sonnet-4-6`        | —              | Claude  |
 | `claude-opus-4.6`     | `claude-opus-4-6-thinking` | Enabled        | Claude  |
+
+Gemini 3.8 Flash (Medium) has been verified against the live `daily-cloudcode-pa.googleapis.com` API using the `gemini-3.8-flash-tiered` backend with medium thinking. The other new backend mappings were inferred from local `agy` data and have not all been verified with an upstream generation request. Gemini 4 Argon did not appear in the account's `fetchAvailableModels` response during that check. Older names remain available for existing clients. `GPT-OSS 120B (Medium)` appears in `agy`, but its serving ID is not yet confirmed and is therefore not advertised here. Unknown model IDs are passed through unchanged if you need to test one explicitly.
 
 You always use the **friendly name** in your client. The proxy handles translation.
 
@@ -174,9 +181,19 @@ hermes config set model.default gemini-3.5-flash
 <summary><b>Claude Code</b></summary>
 
 ```bash
-export ANTHROPIC_BASE_URL=http://127.0.0.1:8877/v1
-claude  # uses claude-sonnet-4.6 through the proxy
+export ANTHROPIC_BASE_URL=http://127.0.0.1:8877
+export ANTHROPIC_AUTH_TOKEN=unused
+export ANTHROPIC_MODEL=gemini-3.8-flash
+claude  # sends /v1/messages to the local proxy
 ```
+
+For the local checkout at `~/projects/antigravity-proxy`, start the proxy in a separate terminal:
+
+```bash
+python3 ~/projects/antigravity-proxy/antigravity_proxy.py
+```
+
+The optional `~/.claude/agy-settings.json` keeps this provider separate from your other Claude Code sessions. After adding `alias agy-claude='claude --dangerously-skip-permissions --settings "$HOME/.claude/agy-settings.json"'` to `~/.bashrc`, run `source ~/.bashrc` once (or open a new shell), then `agy-claude`. To verify the proxy without an external model call, use `curl http://127.0.0.1:8877/health`.
 </details>
 
 <details>
@@ -246,7 +263,7 @@ The default client credentials are the same values embedded in every Antigravity
 
 ---
 
-## Two API Endpoints
+## Three API Endpoints
 
 ### 1. OpenAI Chat Completions
 
@@ -256,7 +273,15 @@ POST /v1/chat/completions
 
 Standard OpenAI format with messages, tools, and streaming. Use this for any OpenAI-compatible client.
 
-### 2. Native Gemini Passthrough
+### 2. Anthropic Messages (Claude Code)
+
+```
+POST /v1/messages
+```
+
+Accepts text, tool definitions, `tool_use`/`tool_result` history, and streaming SSE. Non-text user content (images and files) is rejected instead of silently discarded. Usage in a stream may arrive only at the end, so the final `message_delta` updates both token counts. For Gemini targets, the Anthropic adapter removes Claude Code's recognised billing-header and exact agent-identity lines from system instructions, preserving other lines in the same block. Those two lines independently triggered upstream `RESOURCE_EXHAUSTED` during live testing. The other newly advertised model IDs have not all been validated against the live upstream.
+
+### 3. Native Gemini Passthrough
 
 ```
 POST /v1beta/models/{model}:generateContent
@@ -339,7 +364,7 @@ agy && systemctl --user restart antigravity-proxy
 ## How It Works
 
 ```
-Your Client (OpenAI format)
+Your Client (OpenAI or Anthropic format)
     │
     ▼
 Antigravity Proxy (localhost:8877)
@@ -350,10 +375,10 @@ Antigravity Proxy (localhost:8877)
     │  └─ Wraps in Antigravity envelope {project, model, request}
     │
     ▼
-cloudcode-pa.googleapis.com
+daily-cloudcode-pa.googleapis.com
     │
     ▼
-Gemini / Claude models → Response unwrapped → OpenAI format → Your client
+Gemini / Claude models → Response unwrapped → OpenAI or Anthropic format → Your client
 ```
 
 <details>
