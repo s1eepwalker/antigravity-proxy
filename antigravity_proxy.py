@@ -112,6 +112,45 @@ MODEL_MAP = {
 
 DEFAULT_MODEL = "gemini-3.8-flash"
 
+
+def _strip_model_suffix(model):
+    if isinstance(model, str):
+        return re.sub(r"\[1m\]$", "", model.strip(), flags=re.IGNORECASE)
+    return model
+
+
+def _without_image_data(value):
+    if isinstance(value, list):
+        items = [_without_image_data(item) for item in value]
+        return [item for item, _ in items], sum(images for _, images in items)
+    if isinstance(value, dict):
+        source = value.get("source")
+        if value.get("type") == "image" and isinstance(source, dict) and source.get("type") == "base64":
+            value = {**value, "source": {**source, "data": ""}}
+            images = 1
+        else:
+            images = 0
+        items = {key: _without_image_data(item) for key, item in value.items()}
+        return {key: item for key, (item, _) in items.items()}, images + sum(
+            count for _, count in items.values()
+        )
+    return value, 0
+
+
+def _estimate_input_tokens(body):
+    payload = {key: body[key] for key in ("system", "messages", "tools") if key in body}
+    payload, images = _without_image_data(payload)
+    return len(json.dumps(payload, ensure_ascii=False).encode("utf-8")) // 3 + 1 + images * 1600
+
+
+def _context_overflow_limit(message):
+    match = re.search(
+        r"the input token count exceeds\s+the maximum number of tokens allowed\s+(\d+)",
+        str(message).replace("\\n", " "), re.IGNORECASE,
+    )
+    return int(match.group(1)) if match else None
+
+
 # ──────────────────────────────────────────────────────────────────────────────
 # Token / OAuth management (thread-safe)
 # ──────────────────────────────────────────────────────────────────────────────
@@ -1271,6 +1310,9 @@ class ProxyHandler(BaseHTTPRequestHandler):
             if path in ("/v1/chat/completions", "/chat/completions"):
                 self._handle_chat()
                 self._log_req("POST", path, 200, time.time() - t0)
+            elif path in ("/v1/messages/count_tokens", "/messages/count_tokens"):
+                self._handle_count_tokens()
+                self._log_req("POST", path, 200, time.time() - t0)
             elif path in ("/v1/messages", "/messages"):
                 self._handle_anthropic()
                 self._log_req("POST", path, 200, time.time() - t0)
@@ -1329,11 +1371,24 @@ class ProxyHandler(BaseHTTPRequestHandler):
         self._send_json(200, gemini_resp)
 
     def _send_anthropic_error(self, status, message, err_type="api_error"):
+        limit = _context_overflow_limit(message) if status == 400 else None
+        if limit is not None:
+            err_type = "invalid_request_error"
+            message = f"prompt is too long: {limit + 1} tokens > {limit} maximum"
         self._send_json(status, {"type": "error", "error": {"type": err_type, "message": message}})
+
+    def _handle_count_tokens(self):
+        body = self._read_body()
+        if not isinstance(body, dict) or not isinstance(body.get("messages"), list):
+            self._send_anthropic_error(400, "messages must be an array", "invalid_request_error")
+            return
+        self._send_json(200, {"input_tokens": _estimate_input_tokens(body)})
 
     def _handle_anthropic(self):
         body = self._read_body()
         try:
+            if isinstance(body, dict):
+                body["model"] = _strip_model_suffix(body.get("model"))
             requested_model = body.get("model")
             gemini_target = (isinstance(requested_model, str) and
                              MODEL_MAP.get(requested_model, (requested_model, None))[0].startswith("gemini-"))
@@ -1386,7 +1441,7 @@ class ProxyHandler(BaseHTTPRequestHandler):
             self._send_anthropic_error(502, "Upstream returned an empty stream")
             return
         except UpstreamError as e:
-            if e.status == 400 and any(
+            if e.status == 400 and _context_overflow_limit(e) is None and any(
                 "functionResponse" in part
                 for content in envelope["request"]["contents"]
                 for part in content.get("parts", [])
@@ -1450,7 +1505,7 @@ class ProxyHandler(BaseHTTPRequestHandler):
             self._send_error_json("invalid_request", "Request body must be a JSON object", err_type="invalid_request_error", http_code=400)
             return
 
-        openai_model = body.get("model") or DEFAULT_MODEL
+        openai_model = _strip_model_suffix(body.get("model")) or DEFAULT_MODEL
         stream = bool(body.get("stream", False))
 
         # Map model. MODEL_MAP values are (backend_name, thinking_level) tuples.

@@ -28,7 +28,7 @@ Your Tool (OpenAI format)  →  Antigravity Proxy (localhost:8877)  →  Gemini 
 - **Free** — uses the OAuth token from the Antigravity CLI, no paid API key
 - **Universal** — works with OpenAI-compatible tools (Aider, Continue, Hermes, OpenAI SDK, LangChain) and Claude Code via the Anthropic endpoint
 - **No dependencies** — pure Python stdlib, no `pip install` needed
-- **Three endpoints** — OpenAI chat completions, Anthropic Messages for Claude Code, and native Gemini passthrough
+- **Three API formats** — OpenAI chat completions, Anthropic Messages for Claude Code, and native Gemini passthrough
 - **Tool/function calling** — full support, including round-trip through conversation history
 - **Streaming** — SSE streaming support for real-time token generation
 
@@ -37,7 +37,7 @@ Your Tool (OpenAI format)  →  Antigravity Proxy (localhost:8877)  →  Gemini 
 ## Features
 
 - **OpenAI-compatible** `POST /v1/chat/completions` — streaming + non-streaming
-- **Anthropic-compatible** `POST /v1/messages` — JSON and SSE responses for Claude Code
+- **Anthropic-compatible** `POST /v1/messages` and `POST /v1/messages/count_tokens` — Claude Code messages and local token estimates
 - **Native Gemini passthrough** `POST /v1beta/models/{model}:generateContent` — images, structured JSON output
 - **Tool/function calling** — OpenAI tools format → Gemini functionDeclarations, with round-trip encoding
 - **Model auto-mapping** — use friendly names (`gemini-3.5-flash`), the proxy translates to backend names automatically
@@ -291,7 +291,7 @@ The default client credentials are the same values embedded in every Antigravity
 
 ---
 
-## Three API Endpoints
+## Four API Endpoints
 
 ### 1. OpenAI Chat Completions
 
@@ -307,9 +307,17 @@ Standard OpenAI format with messages, tools, and streaming. Use this for any Ope
 POST /v1/messages
 ```
 
-Accepts text, tool definitions, `tool_use`/`tool_result` history, and streaming SSE. Non-text user content (images and files) is rejected instead of silently discarded. Usage in a stream may arrive only at the end, so the final `message_delta` updates both token counts. For Gemini targets, the Anthropic adapter removes Claude Code's recognised billing-header and exact agent-identity lines from system instructions, preserving other lines in the same block. Those two lines independently triggered upstream `RESOURCE_EXHAUSTED` during live testing. The other newly advertised model IDs have not all been validated against the live upstream.
+Accepts text, tool definitions, `tool_use`/`tool_result` history, and streaming SSE. Non-text user content (images and files) is rejected instead of silently discarded. Usage in a stream may arrive only at the end, so the final `message_delta` updates both token counts. For Gemini targets, the Anthropic adapter removes Claude Code's recognised billing-header and exact agent-identity lines from system instructions, preserving other lines in the same block. Those two lines independently triggered upstream `RESOURCE_EXHAUSTED` during live testing. The other newly advertised model IDs have not all been validated against the live upstream. Model names ending in `[1m]` are mapped without that Claude Code context suffix. If Google rejects an oversized prompt, the Anthropic endpoint returns `prompt is too long` so the client can recognise the limit error.
 
-### 3. Native Gemini Passthrough
+### 3. Anthropic Token Counting (Claude Code)
+
+```
+POST /v1/messages/count_tokens
+```
+
+Returns `{"input_tokens": ...}` using a local UTF-8-based estimate over the system prompt, messages, and tools, with a separate allowance for base64 images. This does **not** call Google's tokenizer: it may differ from the upstream count, so very large requests can still exceed the model's context window. Reduce the conversation or start a new one if that happens.
+
+### 4. Native Gemini Passthrough
 
 ```
 POST /v1beta/models/{model}:generateContent

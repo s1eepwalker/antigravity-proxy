@@ -167,6 +167,87 @@ class AnthropicHttpTests(unittest.TestCase):
         self.assertEqual(error.exception.code, 400)
         self.assertEqual(json.loads(error.exception.read())["error"]["type"], "invalid_request_error")
 
+    def test_argon_context_suffix_maps_to_backend_model(self):
+        upstream = {"candidates": [{"content": {"parts": [{"text": "ok"}]}, "finishReason": "STOP"}]}
+        with patch.object(proxy, "call_generate_content", return_value=upstream) as generate:
+            status, _ = self.post(body={"model": "gemini-4-argon[1m]", "max_tokens": 128,
+                                        "messages": [{"role": "user", "content": "hello"}]})
+        self.assertEqual(status, 200)
+        self.assertEqual(generate.call_args.args[0]["model"], "gemini-4-argon-medium")
+
+    def test_openai_context_suffix_maps_to_backend_model(self):
+        upstream = {"candidates": [{"content": {"parts": [{"text": "ok"}]}, "finishReason": "STOP"}]}
+        with patch.object(proxy, "call_generate_content", return_value=upstream) as generate:
+            status, _ = self.post("/v1/chat/completions", {"model": "gemini-4-argon[1m]",
+                                                          "messages": [{"role": "user", "content": "hello"}]})
+        self.assertEqual(status, 200)
+        self.assertEqual(generate.call_args.args[0]["model"], "gemini-4-argon-medium")
+
+    def test_count_tokens_includes_cyrillic_and_tool_definitions(self):
+        body = {"model": "gemini-4-argon[1m]", "messages": [
+            {"role": "user", "content": "я" * 3000}], "tools": [
+            {"name": "Bash", "description": "x" * 900, "input_schema": {"type": "object"}}]}
+        status, raw = self.post("/v1/messages/count_tokens", body)
+        self.assertEqual(status, 200)
+        self.assertGreater(json.loads(raw)["input_tokens"], 2200)
+
+    def test_count_tokens_counts_image_without_base64_text(self):
+        body = {"model": "gemini-4-argon", "messages": [{"role": "user", "content": [
+            {"type": "image", "source": {"type": "base64", "media_type": "image/png", "data": "A" * 30000}}]}]}
+        status, raw = self.post("/v1/messages/count_tokens", body)
+        self.assertEqual(status, 200)
+        self.assertGreater(json.loads(raw)["input_tokens"], 1000)
+        self.assertLess(json.loads(raw)["input_tokens"], 5000)
+
+    def test_count_tokens_rejects_invalid_messages(self):
+        with self.assertRaises(HTTPError) as error:
+            self.post("/v1/messages/count_tokens", {"model": "gemini-4-argon", "messages": "invalid"})
+        self.assertEqual(error.exception.code, 400)
+        self.assertEqual(json.loads(error.exception.read())["error"]["type"], "invalid_request_error")
+
+    def test_context_overflow_returns_prompt_too_long_error(self):
+        overflow = proxy.UpstreamError(
+            'Upstream HTTP 400: {"error": {"message": "The input token count exceeds '
+            'the maximum number of tokens allowed 1048576."}}', status=400)
+        with patch.object(proxy, "call_generate_content", side_effect=overflow):
+            with self.assertRaises(HTTPError) as error:
+                self.post(body={"model": "gemini-4-argon", "max_tokens": 128,
+                                "messages": [{"role": "user", "content": "hello"}]})
+        self.assertEqual(error.exception.code, 400)
+        response = json.loads(error.exception.read())
+        self.assertEqual(response["error"]["type"], "invalid_request_error")
+        self.assertIn("prompt is too long", response["error"]["message"])
+        self.assertIn("1048576", response["error"]["message"])
+
+    def test_stream_overflow_with_tool_result_does_not_retry(self):
+        overflow = proxy.UpstreamError(
+            "The input token count exceeds the maximum number of tokens allowed 1048576.", status=400)
+
+        def rejected(_):
+            raise overflow
+            yield
+
+        body = {"model": "gemini-4-argon", "max_tokens": 128, "stream": True,
+                "messages": [
+                    {"role": "assistant", "content": [
+                        {"type": "tool_use", "id": "call_f1|sig", "name": "Bash", "input": {}}]},
+                    {"role": "user", "content": [
+                        {"type": "tool_result", "tool_use_id": "call_f1|sig", "content": "ok"}]}]}
+        with patch.object(proxy, "stream_generate_content", side_effect=rejected), \
+             patch.object(proxy, "call_generate_content") as generate:
+            with self.assertRaises(HTTPError) as error:
+                self.post(body=body)
+        self.assertEqual(error.exception.code, 400)
+        self.assertEqual(json.loads(error.exception.read())["error"]["type"], "invalid_request_error")
+        generate.assert_not_called()
+
+    def test_unrelated_upstream_400_is_not_context_overflow(self):
+        with patch.object(proxy, "call_generate_content", side_effect=proxy.UpstreamError("bad model", status=400)):
+            with self.assertRaises(HTTPError) as error:
+                self.post()
+        response = json.loads(error.exception.read())
+        self.assertEqual(response["error"], {"type": "api_error", "message": "bad model"})
+
     def test_empty_upstream_rejected(self):
         with patch.object(proxy, "call_generate_content", return_value={"candidates": []}):
             with self.assertRaises(HTTPError) as error:
